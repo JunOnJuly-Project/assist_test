@@ -1,7 +1,7 @@
 import os
 import uuid
 import sys
-import asyncio
+import subprocess
 import shutil
 from loguru import logger
 
@@ -21,9 +21,10 @@ class UvSandbox:
         self.sandbox_root = os.path.join(base_dir, "temp", "sandbox")
         os.makedirs(self.sandbox_root, exist_ok=True)
 
-    async def run_code(self, source_code: str) -> str:
+    def run_code(self, source_code: str) -> str:
         """
-        주어진 Python 소스 코드를 파일로 저장한 뒤 격리된 프로세스로 실행합니다.
+        주어진 Python 소스 코드를 파일로 저장한 뒤 격리된 프로세스로 동기 실행합니다.
+        (FastAPI의 하위 쓰레드에서 윈도우 ProactorEventLoop 충돌을 막기 위한 동기 subprocess 기반 설계)
         
         :param source_code: 실행할 Python 문자열 코드
         :return: 코드가 실행된 후 출력된 stdout 및 stderr 텍스트
@@ -36,7 +37,7 @@ class UvSandbox:
         script_path = os.path.join(session_dir, "agent_script.py")
         
         try:
-            # 1. 스크립트 파일 작성
+            # 1. 스크립트 파일 작성 (윈도우 호환성 보장)
             with open(script_path, "w", encoding="utf-8") as f:
                 f.write(source_code)
                 
@@ -44,38 +45,36 @@ class UvSandbox:
             
             # 2. uv run 명령어로 서브프로세스 파생
             # uv run은 스크립트에 선언된 의존성만 임시로 설치하여 글로벌 환경 오염을 차단함 (PEP 723 기반)
-            process = await asyncio.create_subprocess_exec(
-                "uv", "run", "agent_script.py",
-                cwd=session_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            # 3. Timeout 적용 실행 및 출력 대기
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout_sec)
-            except asyncio.TimeoutError:
+                # 윈도우 스레드 충돌 및 좀비 프로세스 완벽 방어형 동기 subprocess 호출
+                process = subprocess.run(
+                    ["uv", "run", "agent_script.py"],
+                    cwd=session_dir,
+                    capture_output=True,
+                    text=True,       # 자동 UTF-8 디코딩
+                    timeout=self.timeout_sec
+                )
+                
+                # 3. 결과 출력 처리 (표준 출력 + 표준 에러 합산)
+                output = ""
+                if process.stdout:
+                    output += process.stdout
+                if process.stderr:
+                    err_text = process.stderr
+                    if err_text.strip():
+                        output += f"\n[stderr]\n{err_text}"
+                
+                # 콘솔에 아무것도 출력하지 않았을 경우
+                if not output.strip():
+                    output = "실행이 완료되었으나, 출력(stdout) 결과가 없습니다. (print문을 사용했는지 확인하세요)"
+                    
+                logger.info(f"🟢 [Sandbox] 코드 실행 완료 (Exit Code: {process.returncode})")
+                return output.strip()
+                
+            except subprocess.TimeoutExpired:
                 # 무한 루프 등 타임아웃 발생 시 즉각 자식 프로세스 학살 (Kill)
-                process.kill()
-                await process.communicate() # 좀비 프로세스 방어
                 logger.warning(f"⚠️ [Sandbox] 코드 실행이 {self.timeout_sec}초를 초과하여 강제 종료되었습니다.")
                 return f"[Timeout Error] 스크립트 실행이 {self.timeout_sec}초 타임아웃 제한을 초과하여 샌드박스에서 강제 종료되었습니다."
-            
-            # 4. 결과 출력 처리 (표준 출력 + 표준 에러 합산)
-            output = ""
-            if stdout:
-                output += stdout.decode('utf-8', errors='ignore')
-            if stderr:
-                err_text = stderr.decode('utf-8', errors='ignore')
-                if err_text.strip():
-                    output += f"\n[stderr]\n{err_text}"
-            
-            # 콘솔에 아무것도 출력하지 않았을 경우
-            if not output.strip():
-                output = "실행이 완료되었으나, 출력(stdout) 결과가 없습니다. (print문을 사용했는지 확인하세요)"
-                
-            logger.info(f"🟢 [Sandbox] 코드 실행 완료 (Exit Code: {process.returncode})")
-            return output.strip()
 
         except Exception as e:
             logger.error(f"❌ [Sandbox] 서브프로세스 샌드박스 크래시 발생: {e}")
