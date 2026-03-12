@@ -1,8 +1,13 @@
 import time
+import sys
+import os
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
+
+# backend 폴더 위치를 파이썬 경로에 추가 (명령어 'python main.py' 구동 호환성 해결)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 커스텀 보안/최적화 모듈 (Phase 1 목적)
 from backend.security.guardrail import PromptGuard
