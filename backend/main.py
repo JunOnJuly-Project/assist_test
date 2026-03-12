@@ -1,7 +1,8 @@
 import time
 import sys
 import os
-from fastapi import FastAPI, HTTPException, Request
+import asyncio
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 from loguru import logger
 import uvicorn
@@ -12,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 커스텀 보안/최적화 모듈 (Phase 1 목적)
 from backend.security.guardrail import PromptGuard
 from backend.cache.semantic import SemanticCache
+from backend.security.thread_lock import global_lock_manager
 
 # 1. FastAPI 코어 애플리케이션 초기화
 app = FastAPI(
@@ -49,55 +51,62 @@ class ChatResponse(BaseModel):
 
 # 3. 채팅/검색 메인 엔드포인트
 @app.post("/chat", response_model=ChatResponse)
-def unified_chat_endpoint(request: ChatRequest):
+async def unified_chat_endpoint(request: ChatRequest):
+    """
+    사용자의 실제 입력을 비동기로 받아 처리합니다. 
+    최우선순위(채팅) 작업이므로 글로벌 CPU 락을 획득하여 문서(RAG) Ingestion 등의 백그라운드 작업을 막습니다.
+    """
     prompt = request.prompt.strip()
     logger.info(f"📩 새 채팅 유입: '{prompt}'")
     
     start_time = time.time()
+    
+    # [방어막] 채팅 세션 진입 전 반드시 스레드 락(CPU 권한)을 획득 대기합니다.
+    await global_lock_manager.acquire_lock_for_chat()
 
-    # --- [Phase 0: 캐시 및 락 획득 인터셉터 계층] ---
+    try:
+        # --- [Phase 0: 캐시 및 악의성 인터셉터 계층] ---
+        is_safe = guard.check_prompt(prompt)
+        if not is_safe:
+            logger.warning(f"🚨 [보안 경고] 악의적 프롬프트 인젝션이 감지되어 세션을 차단했습니다.")
+            raise HTTPException(
+                status_code=403, 
+                detail="[보안 통제] 인젝션 공격 또는 금지된 프롬프트가 감지되었습니다. 요청이 차단됩니다."
+            )
 
-    # 1단계. 악의성 검열 (Red Teaming Security)
-    # 시스템 프롬프트 조작이나 파이썬 샌드박스 공격 언어를 막아냅니다.
-    is_safe = guard.check_prompt(prompt)
-    if not is_safe:
-        logger.warning(f"🚨 [보안 경고] 악의적 프롬프트 인젝션이 감지되어 세션을 차단했습니다.")
-        raise HTTPException(
-            status_code=403, 
-            detail="[보안 통제] 인젝션 공격 또는 금지된 프롬프트가 감지되었습니다. 요청이 차단됩니다."
-        )
+        cached_response = cache.search(prompt)
+        if cached_response:
+            elapsed = time.time() - start_time
+            logger.info(f"⚡ [최적화 반환] 캐시 반환에 성공했습니다. 소요시간: {elapsed:.3f}초")
+            return ChatResponse(
+                response=cached_response, 
+                is_cached=True, 
+                execution_time_sec=round(elapsed, 3)
+            )
 
-    # 2단계. 시맨틱 캐시(GPTCache) 확인
-    # Ollama 엔진(CPU 극한 점유)을 호출하기 전 메모리 DB에서 과거 답변 서치.
-    cached_response = cache.search(prompt)
-    if cached_response:
+        # --- [Phase 1: 모델 연산 브레인 (CPU-Only 한계통제 블록)] ---
+        logger.info("⚙️ [추론 이관] 캐시에 없는 질문입니다. LLM 추론 엔진 연산을 시작합니다...")
+        
+        # 임시 대기시간 시뮬레이션
+        await asyncio.sleep(1.5) 
+        simulated_agent_response = f"Ollama 7B 모델에서 '{prompt}'에 대한 구조화된 답변을 생성했습니다. (Phase 1 더미 응답입니다)"
+        
+        # (이후 LLM 출력 응답을 캐시에 밀어넣기)
+        cache.put(prompt, simulated_agent_response)
+        
         elapsed = time.time() - start_time
-        logger.info(f"⚡ [최적화 반환] 캐시 반환에 성공했습니다. 소요시간: {elapsed:.3f}초")
+        logger.info(f"✅ [정상 반환] 신규 답변 생성이 종료되었습니다. 소요시간: {elapsed:.3f}초")
+        
         return ChatResponse(
-            response=cached_response, 
-            is_cached=True, 
+            response=simulated_agent_response, 
+            is_cached=False, 
             execution_time_sec=round(elapsed, 3)
         )
-
-    # --- [Phase 1: 현재는 더미 Code-Agent 응답 처리 (Ollama 파이프라인 전)] ---
-    # 나중에 여기에 Thread-Lock 및 SmolAgents가 바인딩됩니다.
-    logger.info("⚙️ [추론 이관] 캐시에 없는 질문입니다. LLM 추론 엔진 연산을 시작합니다...")
-    
-    # 임시 목업 답변 (백엔드 통합 검증용)
-    simulated_agent_response = f"Ollama 7B 모델에서 '{prompt}'에 대한 구조화된 답변을 생성했습니다. (Phase 1 더미 응답입니다)"
-    time.sleep(1.5) # 연산 딜레이 시뮬레이션
-    
-    # 엔진이 열심히 대답한 내용을 다음 호출을 위해 1초 만에 SQLite에 적재 (최적화)
-    cache.put(prompt, simulated_agent_response)
-    
-    elapsed = time.time() - start_time
-    logger.info(f"✅ [정상 반환] 신규 답변 생성이 종료되었습니다. 소요시간: {elapsed:.3f}초")
-    
-    return ChatResponse(
-        response=simulated_agent_response, 
-        is_cached=False, 
-        execution_time_sec=round(elapsed, 3)
-    )
+        
+    finally:
+        # 응답이 반환되거나, 악성 코드로 튕겨나가거나(에러) 상관없이 
+        # 무조건 Lock을 반납하여 CPU가 백그라운드 작업에게 양도되도록 보장합니다(Fail-Safe).
+        global_lock_manager.release_lock_from_chat()
 
 if __name__ == "__main__":
     # 로컬 네트워크에서만 접근 가능하도록 127.0.0.1 고정
