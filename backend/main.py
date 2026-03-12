@@ -146,6 +146,9 @@ async def unified_chat_endpoint(request: ChatRequest):
             "elapsed_seconds": round(elapsed, 2)
         }
         
+    except HTTPException:
+        # PromptGuard 403 등 의도된 예외는 그대로 프론트엔드에 전달
+        raise
     except Exception as e:
         logger.error(f"❌ [Chat EndPoint] 백엔드 채팅 엔진 붕괴: {e}")
         raise HTTPException(status_code=500, detail="서버 내부 코어 연산 중 에러가 터졌습니다.")
@@ -171,7 +174,7 @@ async def code_agent_endpoint(request: ChatRequest):
     start_time = time.time()
     try:
         # 1. 시맨틱 캐시로 이미 풀었던 코드 미션인지 스킵 시도
-        cached = cache.search(f"{prompt} [AGENT_MODE]")
+        cached = await asyncio.to_thread(cache.search, f"{prompt} [AGENT_MODE]")
         if cached:
             return {
                 "status": "success",
@@ -237,6 +240,11 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
             shutil.copyfileobj(file.file, f)
             
         file_size = os.path.getsize(file_path)
+        # [방어 4번] 50MB 초과 파일 업로드 차단 (DoS/디스크 고갈 공격 방어)
+        MAX_FILE_SIZE = 50 * 1024 * 1024
+        if file_size > MAX_FILE_SIZE:
+            os.remove(file_path)
+            raise HTTPException(status_code=413, detail=f"[보안 통제] 파일 크기가 50MB를 초과합니다. ({file_size} bytes)")
         logger.info(f"💾 로컬 격리 보관소에 파일 저장 완료. 용량: {file_size} bytes")
         
         # [백그라운드 파이프라인 트리거]

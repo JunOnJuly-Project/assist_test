@@ -1,4 +1,3 @@
-import os
 from loguru import logger
 from smolagents import Tool
 from backend.agent.sandbox.uv_env import uv_sandbox

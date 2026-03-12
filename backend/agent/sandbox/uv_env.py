@@ -1,6 +1,5 @@
 import os
 import uuid
-import sys
 import subprocess
 import shutil
 from loguru import logger
