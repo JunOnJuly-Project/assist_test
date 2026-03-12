@@ -3,7 +3,7 @@ import sys
 import os
 import asyncio
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from loguru import logger
 import uvicorn
 
@@ -43,7 +43,8 @@ def startup_event():
 
 # 2. 입출력 스키마(DTO) 정의
 class ChatRequest(BaseModel):
-    prompt: str
+    # [방어막 1] 무제한 프롬프트 폭격(DoS)을 막기 위해 4000자 제한 강제 통제
+    prompt: str = Field(..., max_length=4000, description="사용자 질문 (최대 4000자)")
 
 class ChatResponse(BaseModel):
     response: str
@@ -61,13 +62,16 @@ async def unified_chat_endpoint(request: ChatRequest):
     logger.info(f"📩 새 채팅 유입: '{prompt}'")
     
     start_time = time.time()
+    lock_acquired = False
     
-    # [방어막] 채팅 세션 진입 전 반드시 스레드 락(CPU 권한)을 획득 대기합니다.
-    await global_lock_manager.acquire_lock_for_chat()
-
     try:
+        # [방어막 2] 채팅 세션 진입 전 반드시 스레드 락(CPU 권한)을 획득 대기합니다.
+        await global_lock_manager.acquire_lock_for_chat()
+        lock_acquired = True
+
         # --- [Phase 0: 캐시 및 악의성 인터셉터 계층] ---
-        is_safe = guard.check_prompt(prompt)
+        # [방어막 3] 메인 비동기 루프 대기열 마비(Deadlock)를 막기 위해 별도 스레드로 격리하여 실행
+        is_safe = await asyncio.to_thread(guard.check_prompt, prompt)
         if not is_safe:
             logger.warning(f"🚨 [보안 경고] 악의적 프롬프트 인젝션이 감지되어 세션을 차단했습니다.")
             raise HTTPException(
@@ -75,7 +79,7 @@ async def unified_chat_endpoint(request: ChatRequest):
                 detail="[보안 통제] 인젝션 공격 또는 금지된 프롬프트가 감지되었습니다. 요청이 차단됩니다."
             )
 
-        cached_response = cache.search(prompt)
+        cached_response = await asyncio.to_thread(cache.search, prompt)
         if cached_response:
             elapsed = time.time() - start_time
             logger.info(f"⚡ [최적화 반환] 캐시 반환에 성공했습니다. 소요시간: {elapsed:.3f}초")
@@ -92,7 +96,8 @@ async def unified_chat_endpoint(request: ChatRequest):
         actual_llm_response = await ollama_client.generate_thought_and_action(prompt)
         
         # 엔진이 무사히 대답한 내용을 다음 호출을 위해 SQLite에 적재 (최적화)
-        cache.put(prompt, actual_llm_response)
+        # SQLite I/O 역시 100% 동기식이므로 메인 루프 방어
+        await asyncio.to_thread(cache.put, prompt, actual_llm_response)
         
         elapsed = time.time() - start_time
         logger.info(f"✅ [정상 반환] 신규 답변 생성이 종료되었습니다. 소요시간: {elapsed:.3f}초")
@@ -104,9 +109,12 @@ async def unified_chat_endpoint(request: ChatRequest):
         )
         
     finally:
-        # 응답이 반환되거나, 악성 코드로 튕겨나가거나(에러) 상관없이 
-        # 무조건 Lock을 반납하여 CPU가 백그라운드 작업에게 양도되도록 보장합니다(Fail-Safe).
-        global_lock_manager.release_lock_from_chat()
+        # [방어막 4] 실제로 락을 취득했을 때만 풀리도록 Fail-Safe 예외를 정밀하게 분리
+        if lock_acquired:
+            try:
+                global_lock_manager.release_lock_from_chat()
+            except Exception as e:
+                logger.error(f"❌ [TaskManager] Lock 강제 해제 중 충돌 방어됨: {e}")
 
 if __name__ == "__main__":
     # 로컬 네트워크에서만 접근 가능하도록 127.0.0.1 고정

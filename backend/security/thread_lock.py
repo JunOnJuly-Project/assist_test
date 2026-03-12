@@ -33,9 +33,12 @@ class TaskManager:
         """
         채팅 응답이 끝났을 때 다시 Lock을 해제하여 백그라운드 봇이 CPU를 쓸 수 있게 길을 터줍니다.
         """
-        if self.cpu_lock.locked():
-            self.cpu_lock.release()
-            logger.info("🔴 [TaskManager] 채팅 세션이 완료되어 CPU Lock을 해제합니다. (RAG 백그라운드 재가동)")
+        try:
+            if self.cpu_lock.locked():
+                self.cpu_lock.release()
+                logger.info("🔴 [TaskManager] 채팅 세션이 완료되어 CPU Lock을 해제합니다. (RAG 백그라운드 재가동)")
+        except RuntimeError as e:
+            logger.warning(f"[TaskManager] Lock 해제 중 예외 발생 (비정상 종료 보정): {e}")
             
     async def check_lock_for_background(self) -> bool:
         """
