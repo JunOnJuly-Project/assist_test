@@ -1,7 +1,9 @@
 from loguru import logger
 from smolagents import ToolCallingAgent, OpenAIServerModel
+from smolagents.agents import EMPTY_PROMPT_TEMPLATES
 from backend.agent.sandbox.sandbox_tool import sandbox_tool
 import asyncio
+import copy
 
 class AutodidactCodeAgent:
     """
@@ -14,27 +16,26 @@ class AutodidactCodeAgent:
         
         # Ollama의 OpenAI 호환 API 서버 모드를 활용하여 로컬 모델과 통신
         self.model = OpenAIServerModel(
-            model_id="qwen2.5-coder:7b",  # Ollama에 다운받아진 모델 이름
+            model_id="qwen2.5-coder:7b",
             api_base=ollama_host,
-            api_key="dummy_ollama"        # 로컬이라 키는 필요 없지만 규격 준수용 더미
+            api_key="dummy_ollama"
         )
         
-        # 에이전트에게 쥐어줄 무기(도구) 모음집. Phase 3의 핵심인 'execute_python_code' 포함.
+        # 에이전트에게 쥐어줄 무기(도구) 모음집
         self.tools = [sandbox_tool]
         
-        # 자율 행동 기반 요원(Agent) 탑재
+        # smolagents 최신 API: EMPTY_PROMPT_TEMPLATES를 기본 뼈대로 사용하고 system_prompt만 커스텀
+        templates = copy.deepcopy(EMPTY_PROMPT_TEMPLATES)
+        templates["system_prompt"] = """너는 세계 최고의 파이썬 백엔드 개발자이자, 자동화 스크립트 작성 로봇이야.
+사용자가 기능을 요청하면 생각만 하지 말고, 제공된 도구(execute_python_code)를 사용해
+직접 코드를 짠 다음 샌드박스로 실행시키고, 그 결과를 확인해서 대답해라.
+절대로 무한 루프 코드를 던지지 마!
+출력 결과(stdout/stderr)가 보이면 그것을 근거로 사용자에게 최종 보고를 해라."""
+        
         self.agent = ToolCallingAgent(
             tools=self.tools,
             model=self.model,
-            system_prompt='''
-            너는 세계 최고의 파이썬 백엔드 개발자이자, 자동화 스크립트 작성 로봇이야.
-            사용자가 기능을 요청하면 생각만 하지 말고, 제공된 도구(execute_python_code)를 사용해
-            직접 코드를 짠 다음 샌드박스로 실행시키고, 그 결과를 확인해서 대답해라.
-            만약 추가 패키지가 필요하다면 uv의 PEP 723 인라인 메타데이터(```python\n# /// script\n# requires-python = ">=3.11"\n# dependencies = [\n# "requests"\n# ]\n# ///\n``` 형식을 지원함)를 최상단에 주석으로 선언해서 실행해.
-            절대로 무한 루프 코드를 던지지 마!
-            출력 결과(stdout/stderr)가 보이면 그것을 근거로 사용자에게 최종 보고를 해라.
-            ''',
-            max_steps=5  # 재시도 및 자기 검증 최대 횟수 (무한루프 과부하 방어)
+            prompt_templates=templates,
         )
         
     async def solve_task(self, user_prompt: str) -> str:
