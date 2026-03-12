@@ -5,6 +5,7 @@ import asyncio
 import uuid
 import shutil
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from loguru import logger
 import uvicorn
@@ -28,6 +29,14 @@ app = FastAPI(
     title="On-Device Code-Agent Backend",
     version="1.0.0",
     description="CPU 기반 온디바이스 보안 강화 통합 API"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # 프론트엔드 출처(개발망) 모두 허용
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 글로벌 모듈 로컬 캐싱 공간 (인터셉터)
