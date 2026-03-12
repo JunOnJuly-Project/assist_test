@@ -21,6 +21,7 @@ from backend.api.ollama_client import ollama_client
 # 문서 RAG 모듈 (Phase 2 목적)
 from backend.security.file_validator import file_validator
 from backend.rag.pipeline import rag_pipeline
+from backend.agent.code_agent_engine import code_agent_engine
 
 # 1. FastAPI 코어 애플리케이션 초기화
 app = FastAPI(
@@ -58,7 +59,7 @@ class ChatResponse(BaseModel):
     execution_time_sec: float
 
 # 3. 채팅/검색 메인 엔드포인트
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat") # response_model=ChatResponse removed as return type changed to dict
 async def unified_chat_endpoint(request: ChatRequest):
     """
     사용자의 실제 입력을 비동기로 받아 처리합니다. 
@@ -89,11 +90,13 @@ async def unified_chat_endpoint(request: ChatRequest):
         if cached_response:
             elapsed = time.time() - start_time
             logger.info(f"⚡ [최적화 반환] 캐시 반환에 성공했습니다. 소요시간: {elapsed:.3f}초")
-            return ChatResponse(
-                response=cached_response, 
-                is_cached=True, 
-                execution_time_sec=round(elapsed, 3)
-            )
+            return {
+                "status": "success",
+                "prompt": prompt,
+                "response": cached_response, 
+                "is_cached": True, 
+                "elapsed_seconds": round(elapsed, 2)
+            }
 
         # --- [Phase 1: 모델 연산 브레인 (CPU-Only 한계통제 블록)] ---
         logger.info("⚙️ [추론 이관] 캐시에 없는 질문입니다. LLM 추론 엔진 연산을 시작합니다...")
@@ -126,19 +129,67 @@ async def unified_chat_endpoint(request: ChatRequest):
         elapsed = time.time() - start_time
         logger.info(f"✅ [정상 반환] 신규 답변 생성이 종료되었습니다. 소요시간: {elapsed:.3f}초")
         
-        return ChatResponse(
-            response=actual_llm_response, 
-            is_cached=False, 
-            execution_time_sec=round(elapsed, 3)
-        )
+        return {
+            "status": "success",
+            "prompt": prompt,
+            "response": actual_llm_response,
+            "is_cached": False, 
+            "elapsed_seconds": round(elapsed, 2)
+        }
         
+    except Exception as e:
+        logger.error(f"❌ [Chat EndPoint] 백엔드 채팅 엔진 붕괴: {e}")
+        raise HTTPException(status_code=500, detail="서버 내부 코어 연산 중 에러가 터졌습니다.")
     finally:
-        # [방어막 4] 실제로 락을 취득했을 때만 풀리도록 Fail-Safe 예외를 정밀하게 분리
-        if lock_acquired:
-            try:
-                global_lock_manager.release_lock_from_chat()
-            except Exception as e:
-                logger.error(f"❌ [TaskManager] Lock 강제 해제 중 충돌 방어됨: {e}")
+        # [방어 2번] 버그나 에러로 이 블록을 빠져나가더라도 무조건 CPU 권한(Lock)을 RAG 워커에게 돌려줌
+        logger.debug("[Chat] 채팅 사이클 루프 종료. Lock 해제 안전장치 가동.")
+        global_lock_manager.release_lock_from_chat()
+
+@app.post("/agent")
+async def code_agent_endpoint(request: ChatRequest):
+    """
+    [Phase 3] 능동형 자율 코딩 에이전트 브레인 진입로.
+    단순 Q&A가 아닌, 파이썬 코드를 샌드박스에 돌려보고 싶거나 복잡한 버그 픽싱, 자동화 스크립트 작성 등
+    코드와 관련된 임무를 직접 수행하고 검증해주길 바랄 때 호출하는 특수 엔드포인트입니다.
+    """
+    prompt = request.prompt
+    logger.info(f"👨‍💻 [Agent API] 사용자 자율 코딩 미션 수신: {prompt[:30]}...")
+    
+    # 샌드박스(uv run) 및 마이닝을 위해 CPU Lock 대기는 추후 최적화할 수 있으나
+    # 현재는 에이전트 실행이 가장 중요하므로 Lock 획득 후 진행
+    await global_lock_manager.acquire_lock_for_chat()
+    
+    start_time = time.time()
+    try:
+        # 1. 시맨틱 캐시로 이미 풀었던 코드 미션인지 스킵 시도
+        cached = cache.search(f"{prompt} [AGENT_MODE]")
+        if cached:
+            return {
+                "status": "success",
+                "source": "cache",
+                "response": cached,
+                "elapsed_seconds": round(time.time() - start_time, 2)
+            }
+        
+        # 2. 에이전트 엔진에게 미션 위임 (알아서 execute_python_code 툴 사용/반복 검증 수행)
+        agent_answer = await code_agent_engine.solve_task(prompt)
+        
+        # 3. SQLite 캐시에 [AGENT_MODE] 태그를 붙여 저장
+        await asyncio.to_thread(cache.put, f"{prompt} [AGENT_MODE]", agent_answer)
+        
+        elapsed = time.time() - start_time
+        return {
+            "status": "success",
+            "source": "smolagents",
+            "response": agent_answer,
+            "elapsed_seconds": round(elapsed, 2)
+        }
+    except Exception as e:
+        logger.error(f"❌ [Agent API] 에이전트 샌드박스 붕괴: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        global_lock_manager.release_lock_from_chat()
+
 
 # 4. 문서 업로드 및 RAG 지식 주입 백그라운드 라우터
 @app.post("/upload")
