@@ -2,7 +2,7 @@ import time
 import sys
 import os
 import asyncio
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel, Field
 from loguru import logger
 import uvicorn
@@ -15,6 +15,10 @@ from backend.security.guardrail import PromptGuard
 from backend.cache.semantic import SemanticCache
 from backend.security.thread_lock import global_lock_manager
 from backend.api.ollama_client import ollama_client
+
+# 문서 RAG 모듈 (Phase 2 목적)
+from backend.security.file_validator import file_validator
+from backend.rag.pipeline import rag_pipeline
 
 # 1. FastAPI 코어 애플리케이션 초기화
 app = FastAPI(
@@ -115,6 +119,60 @@ async def unified_chat_endpoint(request: ChatRequest):
                 global_lock_manager.release_lock_from_chat()
             except Exception as e:
                 logger.error(f"❌ [TaskManager] Lock 강제 해제 중 충돌 방어됨: {e}")
+
+# 4. 문서 업로드 및 RAG 지식 주입 백그라운드 라우터
+@app.post("/upload")
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    [지연 처리 RAG 문서 엔드포인트]
+    사용자가 파일을 올리면 무서운 보안 검열(file_validator)을 거친 후 일단 "성공!"을 프론트에 즉각 리턴합니다.
+    진짜 무거운 PDF 파싱 및 딥러닝 그래프 추출은 '백그라운드 스레드(BackgroundTasks)' 속으로 격리됩니다.
+    """
+    logger.info(f"📂 새 파일 업로드 요청 감지: {file.filename}")
+    
+    # [방어 1번] 악성 파일 여부 시그니처 샌드박스 검열 (1초 이내 컷)
+    is_safe_file = await file_validator.validate_file(file)
+    if not is_safe_file:
+        raise HTTPException(
+            status_code=415,
+            detail="[보안 통제] 지원하지 않는 확장자나 위변조된 악성 파일 형식입니다. (업로드 차단)"
+        )
+        
+    try:
+        # FastAPI temp 방어구역에 임시 파일로 격리 저장
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        temp_dir = os.path.join(base_dir, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        file_path = os.path.join(temp_dir, file.filename)
+        _, ext = os.path.splitext(file.filename)
+        ext = ext.lower()
+        
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+            
+        logger.info(f"💾 로컬 격리 보관소에 파일 저장 완료. 용량: {len(content)} bytes")
+        
+        # [백그라운드 파이프라인 트리거]
+        # 무거운 파싱과 연산(Fast Track 벡터 인서트 -> 추후 Graph 구축)을 워커에게 미룹니다.
+        background_tasks.add_task(
+            rag_pipeline.process_document_background, 
+            file_path, 
+            file.filename,
+            ext,
+            cache.embedder  # main.py의 싱글톤 SentenceTransformer를 빌려줌 (RAM 절약)
+        )
+        
+        return {
+            "status": "success",
+            "message": "📁 파일 검열을 통과하고 백그라운드 엔진에 접수되었습니다. (현재 벡터 전환(Fast Track) 작업 중)",
+            "filename": file.filename
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 파일 업로드 시스템 에러: {e}")
+        raise HTTPException(status_code=500, detail="서버 내 파일 처리 중 OOM 또는 디스크 에러가 발생했습니다.")
 
 if __name__ == "__main__":
     # 로컬 네트워크에서만 접근 가능하도록 127.0.0.1 고정
