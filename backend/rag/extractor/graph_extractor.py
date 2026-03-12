@@ -32,8 +32,11 @@ class LightRAGExtractor:
         prompt = f"{self.system_prompt}\n\n[문맥]\n{chunk}\n\n[답변(오직 JSON만 출력)]:"
         
         try:
-            # 1. 모델 추론 (JSON 강제)
-            response_text = await ollama_client.generate_thought_and_action(prompt)
+            # 1. 모델 추론 (JSON 강제, format_opts="json" 옵션으로 Ollama 내부 파서 트리거)
+            response_text = await ollama_client.generate_thought_and_action(
+                prompt, 
+                format_opts="json"
+            )
             
             # 2. JSON 파싱 (방어 로직: 모델이 실수로 마크다운 ```json ... ``` 을 붙일 경우 제거)
             clean_json = re.sub(r'```json|```', '', response_text).strip()

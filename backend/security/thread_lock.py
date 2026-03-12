@@ -12,20 +12,27 @@ class TaskManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(TaskManager, cls).__new__(cls)
-            # 공유 자원(CPU 렌더링)에 대한 asyncio 락(Lock) 할당 (FastAPI 비동기 호환)
-            cls._instance.cpu_lock = asyncio.Lock()
-            logger.info("🔒 [TaskManager] 전역 CPU Thread-Lock 매니저가 초기화되었습니다.")
+            # 런타임 이벤트 루프에서 생성되도록 초기값 None 설정 (RuntimeError 방지)
+            cls._instance.cpu_lock = None
+            logger.info("🔒 [TaskManager] 전역 CPU Thread-Lock 매니저가 메모리에 로드되었습니다.")
         return cls._instance
+    
+    async def _get_lock(self):
+        # FastAPI의 현재 이벤트 루프 안에서 안전하게 Lock 객체를 생성 (Fail-Safe)
+        if self.cpu_lock is None:
+            self.cpu_lock = asyncio.Lock()
+        return self.cpu_lock
     
     async def acquire_lock_for_chat(self) -> bool:
         """
         사용자 채팅 API가 들어올 때 CPU 사용 권한(Lock)을 획득합니다.
         가장 우선순위가 높습니다.
         """
-        if self.cpu_lock.locked():
+        lock = await self._get_lock()
+        if lock.locked():
             logger.debug("[TaskManager] Lock이 이미 점유되어 있습니다. 채팅 최우선 대기 중...")
             
-        await self.cpu_lock.acquire()
+        await lock.acquire()
         logger.info("🟢 [TaskManager] 채팅 세션이 CPU Lock을 획득했습니다. (RAG 굽기 임시 멉춤)")
         return True
     
@@ -34,7 +41,7 @@ class TaskManager:
         채팅 응답이 끝났을 때 다시 Lock을 해제하여 백그라운드 봇이 CPU를 쓸 수 있게 길을 터줍니다.
         """
         try:
-            if self.cpu_lock.locked():
+            if self.cpu_lock and self.cpu_lock.locked():
                 self.cpu_lock.release()
                 logger.info("🔴 [TaskManager] 채팅 세션이 완료되어 CPU Lock을 해제합니다. (RAG 백그라운드 재가동)")
         except RuntimeError as e:
@@ -44,7 +51,8 @@ class TaskManager:
         """
         (RAG 봇에서 호출) 현재 사용자가 대화 중인지(Lock이 걸렸는지) '비차단형'으로 묻습니다.
         """
-        if self.cpu_lock.locked():
+        lock = await self._get_lock()
+        if lock.locked():
             logger.warning("[TaskManager] ⚠️ 유저가 대화 중입니다. 백그라운드 RAG 파싱을 대기(Sleep)합니다.")
             return False
             

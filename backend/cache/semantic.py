@@ -70,8 +70,11 @@ class SemanticCache:
             
             for blob, response in rows:
                 emb = self._deserialize_embedding(blob)
-                # 코사인 유사도(Cosine Similarity)를 통해 의미적 일치 판별
-                score = np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb))
+                # 코사인 유사도(Cosine Similarity)를 통해 의미적 일치 판별. 0으로 나누기 뻗음(Division by Zero) 방지
+                norm_query = np.linalg.norm(query_emb)
+                norm_emb = np.linalg.norm(emb)
+                denominator = norm_query * norm_emb + 1e-9
+                score = np.dot(query_emb, emb) / denominator
                 if score > best_score:
                     best_score = float(score)
                     best_response = response

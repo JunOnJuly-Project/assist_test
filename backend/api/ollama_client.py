@@ -12,7 +12,7 @@ class OllamaClient:
         self.default_model = "qwen2.5-coder:7b"
         logger.info(f"🔌 [Ollama API] Ollama 클라이언트 세팅 완료. (타겟 LLM: {self.default_model})")
 
-    async def generate_thought_and_action(self, prompt: str, stop_sequences: list = None) -> str:
+    async def generate_thought_and_action(self, prompt: str, stop_sequences: list = None, format_opts: str = None) -> str:
         """
         비동기로 Ollama에 프롬프트를 보내고 텍스트 응답을 수집합니다.
         (CPU 스로틀링 대처를 위해 stream=False 우선 적용, Phase 4 스트리밍 도입 전까지 반환형 통일)
@@ -37,9 +37,13 @@ class OllamaClient:
         if stop_sequences:
             payload["options"]["stop"] = stop_sequences
 
+        # 구조화된 출력(JSON 등) 강제화 옵션
+        if format_opts:
+            payload["format"] = format_opts
+
         try:
-            # 랩탑 연산 속도가 느릴(OOM 회피) 경우를 대비해 넉넉한 120초 비동기 타임아웃
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+            # Graph Extraction 시 문서가 길고 꼬일 경우를 대비해 넉넉한 300초 비동기 타임아웃
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
                 logger.debug(f"[Ollama] LLM 스레드 가동 시작... (1024 토큰 제한)")
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
@@ -63,6 +67,6 @@ class OllamaClient:
             return "[System Error] LLM 연결 실패. Ollama가 백그라운드에서 실행중인지 확인하세요."
         except asyncio.TimeoutError:
             logger.error("[Ollama] 타임아웃 발생 (노트북 CPU 과부하 또는 RAM 스왑 극한 상황)")
-            return "[System Error] 노트북 연산 시간이 120초를 초과하여 타임아웃 처리되었습니다."
+            return "[System Error] 노트북 연산 시간이 300초를 초과하여 타임아웃 처리되었습니다."
 
 ollama_client = OllamaClient()
