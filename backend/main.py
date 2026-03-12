@@ -2,6 +2,8 @@ import time
 import sys
 import os
 import asyncio
+import uuid
+import shutil
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel, Field
 from loguru import logger
@@ -96,11 +98,29 @@ async def unified_chat_endpoint(request: ChatRequest):
         # --- [Phase 1: 모델 연산 브레인 (CPU-Only 한계통제 블록)] ---
         logger.info("⚙️ [추론 이관] 캐시에 없는 질문입니다. LLM 추론 엔진 연산을 시작합니다...")
         
+        # --- [Phase 2: RAG 검색 지식 파이프라인 연계] ---
+        # 실제 Ollama 통신 전 LanceDB에서 관련된 지식(Fast-Track)을 꺼내어 Context에 주입합니다.
+        try:
+            # 1초 만에 문장을 벡터로 바꿈 (CPU 메모리에 존재하는 sroberta 재활용)
+            query_vector = await asyncio.to_thread(cache.embedder.encode, prompt)
+            # 랜스 DB 검색 (가장 유사한 3개의 조각 픽업)
+            rag_contexts = await asyncio.to_thread(rag_pipeline.db.search_similar, query_vector, limit=3)
+        except Exception as e:
+            logger.warning(f"RAG 검색 중 장애 발생 (Ollama 단독 답변으로 넘어갑니다): {e}")
+            rag_contexts = []
+            
+        final_prompt = prompt
+        if rag_contexts:
+            context_str = "\n\n".join(rag_contexts)
+            # Ollama에게 외부 지식망을 달아줌
+            final_prompt = f"다음은 시스템 내부에 저장된 파일 지식입니다. 이를 바탕으로 대답하세요:\n{context_str}\n\n사용자 질의: {prompt}"
+            logger.info("📚 [RAG] 지식베이스에서 3개의 관련 문서 조각을 찾아 모델 프롬프트에 주입했습니다.")
+        
         # [실제 Ollama 통신 계층] 더미를 제거하고 aiohttp로 로컬 LLM에 비동기 프롬프트를 보냅니다.
-        actual_llm_response = await ollama_client.generate_thought_and_action(prompt)
+        actual_llm_response = await ollama_client.generate_thought_and_action(final_prompt)
         
         # 엔진이 무사히 대답한 내용을 다음 호출을 위해 SQLite에 적재 (최적화)
-        # SQLite I/O 역시 100% 동기식이므로 메인 루프 방어
+        # SQLite I/O 역시 100% 동기식이므로 메인 루프 방어 (원래 prompt 기준 저장)
         await asyncio.to_thread(cache.put, prompt, actual_llm_response)
         
         elapsed = time.time() - start_time
@@ -144,22 +164,27 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         temp_dir = os.path.join(base_dir, "temp")
         os.makedirs(temp_dir, exist_ok=True)
         
-        file_path = os.path.join(temp_dir, file.filename)
+        # [방어 2번] Path Traversal 원천 차단: 파일명에 섞인 상위 경로 공격 기호를 무효화시키고 UUID 강제화
+        safe_filename = os.path.basename(file.filename)
+        secure_filename = f"{uuid.uuid4().hex}_{safe_filename}"
+        
+        file_path = os.path.join(temp_dir, secure_filename)
         _, ext = os.path.splitext(file.filename)
         ext = ext.lower()
         
+        # [방어 3번] OOM 폭발 방어: 500MB짜리 PDF도 메모리를 통하지 않고 디스크에 Chunk 단위로 흘려보냄
         with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+            shutil.copyfileobj(file.file, f)
             
-        logger.info(f"💾 로컬 격리 보관소에 파일 저장 완료. 용량: {len(content)} bytes")
+        file_size = os.path.getsize(file_path)
+        logger.info(f"💾 로컬 격리 보관소에 파일 저장 완료. 용량: {file_size} bytes")
         
         # [백그라운드 파이프라인 트리거]
         # 무거운 파싱과 연산(Fast Track 벡터 인서트 -> 추후 Graph 구축)을 워커에게 미룹니다.
         background_tasks.add_task(
             rag_pipeline.process_document_background, 
             file_path, 
-            file.filename,
+            secure_filename,
             ext,
             cache.embedder  # main.py의 싱글톤 SentenceTransformer를 빌려줌 (RAM 절약)
         )
@@ -167,7 +192,7 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
         return {
             "status": "success",
             "message": "📁 파일 검열을 통과하고 백그라운드 엔진에 접수되었습니다. (현재 벡터 전환(Fast Track) 작업 중)",
-            "filename": file.filename
+            "filename": secure_filename
         }
         
     except Exception as e:

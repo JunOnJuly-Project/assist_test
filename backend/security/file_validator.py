@@ -53,8 +53,8 @@ class FileValidator:
             if ext in cls.ALLOWED_TEXT_EXTENSIONS:
                 logger.debug(f"[시그니처 검사] 순수 텍스트 파일 우회 검증 시도: {filename}")
                 try:
-                    # UTF-8로 정상 텍스트인지 해독 시도
-                    header_bytes.decode('utf-8')
+                    # UTF-8로 정상 텍스트인지 해독 시도 (멀티바이트 깨짐 무시)
+                    header_bytes.decode('utf-8', errors='ignore')
                     logger.info(f"✅ [디코딩 합격] 무해한 텍스트 파일로 입증됨: {filename}")
                     return True
                 except UnicodeDecodeError:

@@ -40,8 +40,11 @@ class RAGPipeline:
             
             logger.info(f"⏳ [Pipeline] {total_chunks}조각에 대한 GPU 지식 벡터 변환(Fast Track) 시작...")
             
-            # 3. 청크별로 임베딩을 구하고 LanceDB에 보냄 (한꺼번에 하면 RAM 뻗음)
-            # 여기 핵심! PM의 명령대로 유저가 대화 중일 때는 CPU 권한을 양보해야 함
+            # 3. DB 파편화를 막고 성능을 끌어올리기 위한 Batch 처리 세팅
+            batch_texts = []
+            batch_vectors = []
+            BATCH_SIZE = 10
+            
             for i, chunk in enumerate(chunks):
                 
                 # [안전장치] 채팅 스레드가 CPU를 뺏어갔는지 확인 (비차단 확인)
@@ -54,14 +57,18 @@ class RAGPipeline:
                         await asyncio.sleep(3)
                         
                 # 임베딩 비용 발생구간 (쓰레드 격리)
-                # embedding 리스트 안에 리스트 형태로 lancedb에 넣어주기 위함
                 vector = await asyncio.to_thread(embedder.encode, chunk)
+                batch_texts.append(chunk)
+                batch_vectors.append(vector)
                 
-                # LanceDB 삽입 (1조각 단위)
-                await asyncio.to_thread(self.db.insert_chunks, filename, [chunk], [vector])
-                
-                # 마이크로 커밋 (절전모드 극복용, "조각 1개 연산 성공!")
-                await asyncio.to_thread(job_queue.update_progress, job_id, i + 1, "FAST_TRACK_PROCESSING")
+                # 배치 사이즈에 도달하거나 마지막 조각인 경우 일괄 LanceDB 삽입
+                if len(batch_texts) >= BATCH_SIZE or i == total_chunks - 1:
+                    await asyncio.to_thread(self.db.insert_chunks, filename, batch_texts, batch_vectors)
+                    # 처리된 개수만큼 마이크로 커밋
+                    await asyncio.to_thread(job_queue.update_progress, job_id, i + 1, "FAST_TRACK_PROCESSING")
+                    # 버퍼 비우기
+                    batch_texts.clear()
+                    batch_vectors.clear()
                 
                 # 노트북 프리징 방지용 숨돌리기 (0.1초)
                 await asyncio.sleep(0.1)
@@ -69,13 +76,18 @@ class RAGPipeline:
             # 4. Fast Track (벡터 저장) 완료 (추후 Phase 2 2부에서 Graph 연산으로 넘길 지점)
             await asyncio.to_thread(job_queue.update_progress, job_id, total_chunks, "FAST_TRACK_DONE")
             logger.info(f"🎉 [Pipeline] {filename}의 문서 벡터 생성이 종료되었습니다! 이제 로컬 검색이 가능합니다.")
-            
-            # 임시 파일 삭제
-            if os.path.exists(file_path):
-                os.remove(file_path)
                 
         except Exception as e:
             logger.error(f"❌ [Pipeline] 파이프라인 백그라운드 붕괴 (OOM 또는 파일손상): {e}")
             await asyncio.to_thread(job_queue.update_progress, job_id, 0, "FAILED")
+            
+        finally:
+            # [방어막] 파싱 중 에러가 나거나 크래시가 발생해도 항상 임시 파일을 삭제 (디스크 좀비화 방어)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.debug(f"[Pipeline] 격리되었던 임시 파일을 안전하게 파기했습니다: {file_path}")
+                except Exception as e:
+                    logger.warning(f"[Pipeline] 임시 파일 삭제 실패: {e}")
 
 rag_pipeline = RAGPipeline()
