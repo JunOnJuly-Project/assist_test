@@ -6,6 +6,7 @@ from loguru import logger
 from backend.rag.parser.doc_parser import doc_parser
 from backend.rag.database.job_queue import job_queue
 from backend.rag.database.lancedb_manager import LanceDBManager
+from backend.rag.extractor.graph_extractor import graph_extractor
 from backend.security.thread_lock import global_lock_manager
 
 class RAGPipeline:
@@ -76,6 +77,31 @@ class RAGPipeline:
             # 4. Fast Track (벡터 저장) 완료 (추후 Phase 2 2부에서 Graph 연산으로 넘길 지점)
             await asyncio.to_thread(job_queue.update_progress, job_id, total_chunks, "FAST_TRACK_DONE")
             logger.info(f"🎉 [Pipeline] {filename}의 문서 벡터 생성이 종료되었습니다! 이제 로컬 검색이 가능합니다.")
+            
+            # --- [Phase 2 후반부: LightRAG 핵심망 심층 마이닝] ---
+            logger.info(f"🧠 [Pipeline] {filename}의 문서에 대한 'Graph Extraction(관계망 추출)' 딥러닝을 백그라운드로 시작합니다.")
+            
+            for i, chunk in enumerate(chunks):
+                # [안전장치] 채팅 락 확인 (극도의 무거운 연산이므로 잦은 체크)
+                while True:
+                    can_process = await global_lock_manager.check_lock_for_background()
+                    if can_process:
+                        break
+                    else:
+                        await asyncio.sleep(3)
+                
+                # 그래프 마이닝 (Ollama)
+                await graph_extractor.extract_graph_from_chunk(chunk, filename)
+                
+                # 마이크로 커밋 (절전모드 극복: 현재 몇개의 청크를 그래프 캤는지)
+                await asyncio.to_thread(job_queue.update_progress, job_id, i + 1, "GRAPH_EXTRACTING")
+                
+                # Ollama 엔진의 CPU 발열 방어용 휴식
+                await asyncio.sleep(1)
+                
+            # 전체 완료
+            await asyncio.to_thread(job_queue.update_progress, job_id, total_chunks, "DONE")
+            logger.info(f"💎 [Pipeline] {filename}의 LightRAG 지식 그래프 추출이 모두 완벽하게 종료되었습니다!")
                 
         except Exception as e:
             logger.error(f"❌ [Pipeline] 파이프라인 백그라운드 붕괴 (OOM 또는 파일손상): {e}")
