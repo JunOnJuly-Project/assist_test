@@ -10,10 +10,11 @@ import uvicorn
 # backend 폴더 위치를 파이썬 경로에 추가 (명령어 'python main.py' 구동 호환성 해결)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 커스텀 보안/최적화 모듈 (Phase 1 목적)
+# 커스텀 보안/최적화/통신 모듈 (Phase 1 목적)
 from backend.security.guardrail import PromptGuard
 from backend.cache.semantic import SemanticCache
 from backend.security.thread_lock import global_lock_manager
+from backend.api.ollama_client import ollama_client
 
 # 1. FastAPI 코어 애플리케이션 초기화
 app = FastAPI(
@@ -87,18 +88,17 @@ async def unified_chat_endpoint(request: ChatRequest):
         # --- [Phase 1: 모델 연산 브레인 (CPU-Only 한계통제 블록)] ---
         logger.info("⚙️ [추론 이관] 캐시에 없는 질문입니다. LLM 추론 엔진 연산을 시작합니다...")
         
-        # 임시 대기시간 시뮬레이션
-        await asyncio.sleep(1.5) 
-        simulated_agent_response = f"Ollama 7B 모델에서 '{prompt}'에 대한 구조화된 답변을 생성했습니다. (Phase 1 더미 응답입니다)"
+        # [실제 Ollama 통신 계층] 더미를 제거하고 aiohttp로 로컬 LLM에 비동기 프롬프트를 보냅니다.
+        actual_llm_response = await ollama_client.generate_thought_and_action(prompt)
         
-        # (이후 LLM 출력 응답을 캐시에 밀어넣기)
-        cache.put(prompt, simulated_agent_response)
+        # 엔진이 무사히 대답한 내용을 다음 호출을 위해 SQLite에 적재 (최적화)
+        cache.put(prompt, actual_llm_response)
         
         elapsed = time.time() - start_time
         logger.info(f"✅ [정상 반환] 신규 답변 생성이 종료되었습니다. 소요시간: {elapsed:.3f}초")
         
         return ChatResponse(
-            response=simulated_agent_response, 
+            response=actual_llm_response, 
             is_cached=False, 
             execution_time_sec=round(elapsed, 3)
         )
